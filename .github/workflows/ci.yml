@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      # Runs the unit tests and replays examples/feed.txt as a smoke test.
+      - name: Test
+        run: ctest --test-dir build --build-config Release --output-on-failure
+
+      # Small enough to keep CI quick, large enough to catch a regression that
+      # only shows up under load.
+      - name: Smoke benchmark
+        shell: bash
+        run: |
+          # Single-config generators put the binary in build/, MSVC in build/Release/.
+          if [ -f build/Release/orderengine.exe ]; then
+            bin=build/Release/orderengine.exe
+          elif [ -f build/orderengine.exe ]; then
+            bin=build/orderengine.exe
+          else
+            bin=build/orderengine
+          fi
+          "$bin" --bench 200000

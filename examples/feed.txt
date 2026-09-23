@@ -1,0 +1,33 @@
+# A short session that exercises every order type.
+# Run it with:  orderengine --feed examples/feed.txt
+symbol AAPL
+
+# Two market makers quote both sides. Nothing crosses, so it all rests.
+sell 100.10 300
+sell 100.05 200
+sell 100.05 100
+buy  99.95 250
+buy  99.90 400
+book
+
+# An aggressive buy lifts the whole 100.05 level and part of 100.10.
+# Note the first fill goes to the 200-share order: same price, earlier arrival.
+buy 100.10 350
+book
+tape
+
+# IOC takes what is there and cancels the rest instead of resting.
+buy 100.10 500 ioc
+
+# FOK cannot be filled in full at this price, so it does not trade at all.
+sell 99.95 5000 fok
+
+# A market sell sweeps down the bid side.
+market sell 300
+book
+
+# Amending down keeps queue position; amending up or across re-queues.
+buy 99.80 100
+book
+stats
+latency
