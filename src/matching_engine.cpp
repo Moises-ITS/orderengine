@@ -16,7 +16,7 @@ std::uint64_t elapsed_ns(Clock::time_point start) {
 OrderBook& MatchingEngine::book(const std::string& symbol) {
     const auto it = books_.find(symbol);
     if (it != books_.end()) return it->second;
-    return books_.emplace(symbol, OrderBook{symbol}).first->second;
+    return books_.try_emplace(symbol, symbol).first->second;
 }
 
 const OrderBook* MatchingEngine::find(const std::string& symbol) const {

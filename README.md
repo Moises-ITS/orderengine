@@ -33,8 +33,8 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-That produces `build/orderengine` (the CLI) and `build/ob_tests` (35 tests,
-216 assertions, no test framework to install).
+That produces `build/orderengine` (the CLI) and `build/ob_tests` (36 tests,
+no test framework to install).
 
 ## Run it
 
@@ -66,8 +66,9 @@ echo "buy 100 500" | build/orderengine     # pipe commands in
 ```
 bids_  std::map<Price, Level, std::greater<>>   begin() == best bid
 asks_  std::map<Price, Level, std::less<>>      begin() == best ask
-Level  { Qty total; std::list<Order> orders; }  list order == arrival order
-index_ std::unordered_map<OrderId, {side, price, list iterator}>
+Level  { total, count, head, tail }             intrusive FIFO, head == oldest
+pool_  ObjectPool<OrderNode>                    recycles order nodes
+index_ std::unordered_map<OrderId, {node, level iterator}>
 ```
 
 Two sorted maps, one per side, with the comparator reversed on the bid side so
@@ -77,18 +78,25 @@ when it empties, repeat while the taker still has size and the prices cross.
 
 Three decisions worth spelling out:
 
-**`std::list` for the queue at each price, not `std::vector` or
+**An intrusive linked list for the queue at each price, not `std::vector` or
 `std::priority_queue`.** Time priority is already FIFO, so it needs no heap at
-all â€” a queue is enough. What it does need is cancellation from the *middle*,
-because most orders in a real market are cancelled rather than filled.
-`std::list` splices a node out in O(1) and, crucially, leaves every other
-iterator valid, which is what makes the `index_` shortcut below safe. A
-`priority_queue` cannot remove an arbitrary element at all, and a `vector`
-invalidates everything behind the erase point.
+all — a queue is enough. What it does need is cancellation from the *middle*,
+because most orders in a real market are cancelled rather than filled. Each
+order lives in a node with `prev`/`next` pointers, so unlinking one is O(1) and
+leaves every other node where it was. A `priority_queue` cannot remove an
+arbitrary element at all, and a `vector` shifts everything behind the erase
+point.
 
-**An `OrderId` index straight to the list node.** Cancelling is a hash lookup
-plus a splice, with no scan of the price level. Without it, cancelling would
-mean searching the queue.
+**An object pool for the nodes.** Resting orders come from `ObjectPool`, which
+carves fixed-size slots out of large blocks and recycles them through a free
+list. Once the pool has warmed up, resting or retiring an order is a pointer
+pop or push rather than a call into the allocator, and node addresses never
+move, which is what makes pointing at them from the index safe.
+
+**An `OrderId` index straight to the node and its level.** The index stores a
+pointer to the order's node and a `std::map` iterator to its price level. A
+cancel is a hash lookup, an unlink and, if the level empties, an erase by
+iterator, all constant time: it never scans the queue or searches the price map.
 
 **Cached `total` per level.** Depth queries and fill-or-kill checks read one
 number per level instead of walking its queue, so they cost O(levels) rather
@@ -103,8 +111,8 @@ than O(orders).
 | best bid / best ask | O(1) |
 | submit that rests | O(log L) |
 | submit that trades | O(log L + F) |
-| cancel | O(log L) |
-| amend (size reduction) | O(1) hash + O(log L) |
+| cancel | O(1) |
+| amend (size reduction) | O(1) |
 | depth of k levels | O(k) |
 
 The `log L` is a `std::map` lookup. Production engines at the top of the latency
@@ -176,7 +184,15 @@ level, price priority beating time priority, partial fills on both sides, sweeps
 across levels, cancel from the middle of a queue, IOC/FOK/market semantics, a
 rejected FOK leaving the book byte-for-byte unchanged, and each amend path.
 
-Two of them are worth singling out:
+Three of them are worth singling out:
+
+- **`price_time_priority_matches_a_reference_model`** replays 10,000 randomized
+  sequences of limit, market and cancel orders, each 100 events over a narrow
+  band of prices so that orders queue, cross and fill partially. Every sequence
+  runs through the engine and through a deliberately naive reference book (one
+  vector, a linear scan for the best price, earliest arrival wins a tie), and
+  every fill must agree on maker, price and size, in order. Cancels, rejects,
+  resting state and the final book must agree too.
 
 - **`random_flow_never_breaks_the_book`** replays 20,000 pseudo-random events
   and asserts the invariants after every 500: the book is never crossed, each
@@ -191,9 +207,9 @@ Two of them are worth singling out:
 ## Layout
 
 ```
-include/ob/   types.hpp  order_book.hpp  matching_engine.hpp  latency.hpp  bench.hpp  cli.hpp
+include/ob/   types.hpp  object_pool.hpp  order_book.hpp  matching_engine.hpp  latency.hpp  bench.hpp  cli.hpp
 src/          order_book.cpp  matching_engine.cpp  latency.cpp  bench.cpp  cli.cpp  main.cpp
-tests/        test_order_book.cpp  test_engine.cpp  test_harness.hpp  test_main.cpp
+tests/        test_order_book.cpp  test_engine.cpp  test_priority.cpp  test_harness.hpp  test_main.cpp
 examples/     feed.txt
 ```
 

@@ -40,6 +40,7 @@ add_executable(ob_tests
   tests/test_main.cpp
   tests/test_order_book.cpp
   tests/test_engine.cpp
+  tests/test_priority.cpp
 )
 target_link_libraries(ob_tests PRIVATE ob_core)
 target_include_directories(ob_tests PRIVATE tests)

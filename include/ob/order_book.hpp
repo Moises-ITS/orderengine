@@ -2,13 +2,13 @@
 
 #include <cstddef>
 #include <functional>
-#include <list>
 #include <map>
 #include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+#include "ob/object_pool.hpp"
 #include "ob/types.hpp"
 
 namespace ob {
@@ -18,12 +18,14 @@ namespace ob {
 // Structure
 //   bids_ : std::map<Price, Level, std::greater<>>  -> begin() is the best bid
 //   asks_ : std::map<Price, Level, std::less<>>     -> begin() is the best ask
-//   Level : std::list<Order> in arrival order       -> FIFO gives time priority
-//   index_: OrderId -> {side, price, list iterator} -> O(1) cancel / amend
+//   Level : intrusive FIFO list of OrderNodes       -> FIFO gives time priority
+//   pool_ : ObjectPool<OrderNode>                   -> order nodes are recycled, not new/delete
+//   index_: OrderId -> {node, level iterator}       -> O(1) cancel / amend
 //
-// std::list is the deliberate choice for the level queue: splicing an order out
-// of the middle on cancel is O(1) and, unlike a vector or a priority_queue,
-// iterators to the other orders stay valid, which is what lets index_ work.
+// Each resting order lives in a pool-allocated node linked into its level's
+// queue. The index holds a pointer to that node and an iterator to its level,
+// so a cancel is a hash lookup, an unlink and, if the level empties, an erase
+// by iterator (amortised O(1)): it never searches the queue or the price map.
 class OrderBook {
 public:
     struct LevelView {
@@ -41,6 +43,10 @@ public:
     };
 
     explicit OrderBook(std::string symbol = "TEST");
+
+    // The index points into pool_ and the price maps, so a book stays put.
+    OrderBook(const OrderBook&)            = delete;
+    OrderBook& operator=(const OrderBook&) = delete;
 
     const std::string& symbol() const noexcept { return symbol_; }
 
@@ -83,20 +89,29 @@ public:
     bool invariants_hold() const;
 
 private:
-    using Queue = std::list<Order>;
+    struct OrderNode {
+        Order      order;
+        OrderNode* prev{};
+        OrderNode* next{};
+    };
 
     struct Level {
-        Qty   total{};  // cached sum of remaining qty, so depth() stays O(levels)
-        Queue orders;
+        Qty         total{};  // cached sum of remaining qty, so depth() stays O(levels)
+        std::size_t count{};
+        OrderNode*  head{};   // oldest order: next to trade
+        OrderNode*  tail{};
     };
 
     using BidMap = std::map<Price, Level, std::greater<Price>>;
     using AskMap = std::map<Price, Level, std::less<Price>>;
 
+    // std::map iterators stay valid until their own element is erased, and a
+    // level is only erased once no order points at it.
     struct Locator {
-        Side           side{};
-        Price          price{};
-        Queue::iterator it{};
+        Side             side{};
+        OrderNode*       node{};
+        BidMap::iterator bid{};  // valid when side == Buy
+        AskMap::iterator ask{};  // valid when side == Sell
     };
 
     // A taker at `taker_price` crosses a maker at `maker_price` when it is
@@ -106,8 +121,12 @@ private:
                                        : taker_price <= maker_price;
     }
 
-    Level* level_at(Side side, Price price);
-    void   erase_level(Side side, Price price);
+    static void push_back(Level& level, OrderNode* node) noexcept;
+    static void unlink(Level& level, OrderNode* node) noexcept;
+
+    Level& level_of(const Locator& loc) noexcept {
+        return loc.side == Side::Buy ? loc.bid->second : loc.ask->second;
+    }
 
     template <class Book>
     Qty available(const Book& book, const Order& taker) const;
@@ -121,6 +140,7 @@ private:
     std::string        symbol_;
     BidMap             bids_;
     AskMap             asks_;
+    ObjectPool<OrderNode> pool_;
     std::unordered_map<OrderId, Locator> index_;
     std::vector<Trade> tape_;
     std::size_t        tape_limit_{4096};

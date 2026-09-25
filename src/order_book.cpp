@@ -45,21 +45,24 @@ std::string format_price(Price ticks) {
 
 OrderBook::OrderBook(std::string symbol) : symbol_(std::move(symbol)) {}
 
-OrderBook::Level* OrderBook::level_at(Side side, Price price) {
-    if (side == Side::Buy) {
-        auto it = bids_.find(price);
-        return it == bids_.end() ? nullptr : &it->second;
+void OrderBook::push_back(Level& level, OrderNode* node) noexcept {
+    node->prev = level.tail;
+    node->next = nullptr;
+    if (level.tail != nullptr) {
+        level.tail->next = node;
+    } else {
+        level.head = node;
     }
-    auto it = asks_.find(price);
-    return it == asks_.end() ? nullptr : &it->second;
+    level.tail   = node;
+    level.total += node->order.remaining;
+    ++level.count;
 }
 
-void OrderBook::erase_level(Side side, Price price) {
-    if (side == Side::Buy) {
-        bids_.erase(price);
-    } else {
-        asks_.erase(price);
-    }
+void OrderBook::unlink(Level& level, OrderNode* node) noexcept {
+    (node->prev != nullptr ? node->prev->next : level.head) = node->next;
+    (node->next != nullptr ? node->next->prev : level.tail) = node->prev;
+    level.total -= node->order.remaining;
+    --level.count;
 }
 
 // Liquidity a taker could consume right now, without mutating anything.
@@ -92,11 +95,11 @@ void OrderBook::match(Book& book, Order& taker, ExecReport& report) {
         }
 
         Level& level = level_it->second;
-        auto&  queue = level.orders;
 
-        while (taker.remaining > 0 && !queue.empty()) {
-            Order&    maker = queue.front();
-            const Qty fill  = std::min(taker.remaining, maker.remaining);
+        while (taker.remaining > 0 && level.head != nullptr) {
+            OrderNode* node  = level.head;
+            Order&     maker = node->order;
+            const Qty  fill  = std::min(taker.remaining, maker.remaining);
 
             taker.remaining -= fill;
             maker.remaining -= fill;
@@ -109,11 +112,12 @@ void OrderBook::match(Book& book, Order& taker, ExecReport& report) {
 
             if (maker.remaining == 0) {
                 index_.erase(maker.id);
-                queue.pop_front();
+                unlink(level, node);
+                pool_.destroy(node);
             }
         }
 
-        if (queue.empty()) book.erase(level_it);
+        if (level.head == nullptr) book.erase(level_it);
     }
 }
 
@@ -131,17 +135,16 @@ void OrderBook::record(const Trade& t) {
 }
 
 void OrderBook::rest(Order order) {
+    OrderNode* node = pool_.create(order);
+    Locator    loc{order.side, node, {}, {}};
     if (order.side == Side::Buy) {
-        Level& level = bids_[order.price];
-        level.total += order.remaining;
-        level.orders.push_back(order);
-        index_[order.id] = Locator{Side::Buy, order.price, std::prev(level.orders.end())};
+        loc.bid = bids_.try_emplace(order.price).first;
+        push_back(loc.bid->second, node);
     } else {
-        Level& level = asks_[order.price];
-        level.total += order.remaining;
-        level.orders.push_back(order);
-        index_[order.id] = Locator{Side::Sell, order.price, std::prev(level.orders.end())};
+        loc.ask = asks_.try_emplace(order.price).first;
+        push_back(loc.ask->second, node);
     }
+    index_.emplace(order.id, loc);
 }
 
 ExecReport OrderBook::submit(Order order) {
@@ -214,10 +217,18 @@ bool OrderBook::cancel(OrderId id) {
     const Locator loc = it->second;
     index_.erase(it);
 
-    Level* level = level_at(loc.side, loc.price);
-    level->total -= loc.it->remaining;
-    level->orders.erase(loc.it);
-    if (level->orders.empty()) erase_level(loc.side, loc.price);
+    // Every step is O(1): the node and its level come straight from the index,
+    // and erasing a map element by iterator is amortised constant time.
+    Level& level = level_of(loc);
+    unlink(level, loc.node);
+    pool_.destroy(loc.node);
+    if (level.head == nullptr) {
+        if (loc.side == Side::Buy) {
+            bids_.erase(loc.bid);
+        } else {
+            asks_.erase(loc.ask);
+        }
+    }
     return true;
 }
 
@@ -233,7 +244,7 @@ ExecReport OrderBook::amend(OrderId id, Price new_price, Qty new_qty) {
     }
 
     const Locator loc     = it->second;
-    Order&        current = *loc.it;
+    Order&        current = loc.node->order;
 
     if (new_qty == 0) {
         cancel(id);
@@ -243,11 +254,11 @@ ExecReport OrderBook::amend(OrderId id, Price new_price, Qty new_qty) {
 
     // A pure size reduction at the same price keeps queue position, exactly as
     // a real venue would: the order never leaves the queue.
-    if (new_price == loc.price && new_qty < current.remaining) {
+    if (new_price == current.price && new_qty < current.remaining) {
         const Qty delta = current.remaining - new_qty;
         current.remaining = new_qty;
         current.qty      -= delta;  // keeps filled() == qty - remaining honest
-        level_at(loc.side, loc.price)->total -= delta;
+        level_of(loc).total -= delta;
         report.remaining = new_qty;
         report.resting   = true;
         return report;
@@ -298,7 +309,7 @@ std::vector<OrderBook::LevelView> OrderBook::depth(Side side, std::size_t max_le
     const auto take = [&](const auto& book) {
         for (const auto& [price, level] : book) {
             if (out.size() >= max_levels) break;
-            out.push_back(LevelView{price, level.total, level.orders.size()});
+            out.push_back(LevelView{price, level.total, level.count});
         }
     };
     if (side == Side::Buy) {
@@ -313,6 +324,7 @@ void OrderBook::clear() {
     bids_.clear();
     asks_.clear();
     index_.clear();
+    pool_.clear();
     tape_.clear();
     stats_    = Stats{};
     next_seq_ = 1;
@@ -328,20 +340,25 @@ bool OrderBook::invariants_hold() const {
     std::size_t counted = 0;
     const auto  check   = [&](const auto& book) {
         for (const auto& [price, level] : book) {
-            if (level.orders.empty()) return false;  // empty levels must be erased
-            Qty sum = 0;
-            for (const Order& o : level.orders) {
+            if (level.head == nullptr) return false;  // empty levels must be erased
+            Qty         sum = 0;
+            std::size_t n   = 0;
+            for (const OrderNode* node = level.head; node != nullptr; node = node->next) {
+                const Order& o = node->order;
                 if (o.remaining == 0) return false;
                 if (o.price != price) return false;
+                if (node->next == nullptr && node != level.tail) return false;
                 sum += o.remaining;
+                ++n;
             }
+            if (n != level.count) return false;
             if (sum != level.total) return false;
-            counted += level.orders.size();
+            counted += level.count;
         }
         return true;
     };
     if (!check(bids_) || !check(asks_)) return false;
-    return counted == index_.size();
+    return counted == index_.size() && counted == pool_.live();
 }
 
 }  // namespace ob
