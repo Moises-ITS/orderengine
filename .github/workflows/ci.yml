@@ -16,27 +16,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
 
-      - name: Build
-        run: cmake --build build --config Release
+      # Compiles, runs the 40 JUnit tests and builds target/orderengine.jar.
+      - name: Build and test
+        run: ./mvnw -B verify
+        shell: bash
 
-      # Runs the unit tests and replays examples/feed.txt as a smoke test.
-      - name: Test
-        run: ctest --test-dir build --build-config Release --output-on-failure
+      - name: Replay the example feed
+        run: java -jar target/orderengine.jar --feed examples/feed.txt
 
       # Small enough to keep CI quick, large enough to catch a regression that
-      # only shows up under load.
+      # only shows up under load. CI runners are too noisy for latency numbers.
       - name: Smoke benchmark
-        shell: bash
-        run: |
-          # Single-config generators put the binary in build/, MSVC in build/Release/.
-          if [ -f build/Release/orderengine.exe ]; then
-            bin=build/Release/orderengine.exe
-          elif [ -f build/orderengine.exe ]; then
-            bin=build/orderengine.exe
-          else
-            bin=build/orderengine
-          fi
-          "$bin" --bench 200000
+        run: java -jar target/orderengine.jar --bench 200000
