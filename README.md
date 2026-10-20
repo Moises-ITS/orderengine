@@ -1,15 +1,19 @@
 # orderengine
 
-A limit order book and matching engine in C++20, matching orders by **price-time
-priority** the way a real exchange does: best price first, and within a price,
-whoever arrived first.
+A limit order book and matching engine in Java 17, matching orders by
+**price-time priority** the way a real exchange does: best price first, and
+within a price, whoever arrived first.
 
-Around 4-5 million operations per second on one core, with a median matching
-latency of ~200ns. It ships as a single binary with an interactive CLI, a
-file-based order feed, a throughput benchmark and a latency histogram.
+The engine keeps its price levels in a `TreeMap`, reads the top of the book in
+O(1), and cancels in O(1). Object pooling and primitive collections keep its
+steady state free of garbage. At an offered load of **2M orders/sec**, its p99
+latency is **3.5–7 µs**. A straightforward version of the same algorithm on JDK
+collections, kept in the repo as the baseline, has a p99 of **10–20 ms**. It
+ships as one jar with an interactive CLI, a file-based order feed, a
+coordinated-omission-correct load test and a JMH suite. There are 40 JUnit tests.
 
 ```
-$ orderengine
+$ java -jar target/orderengine.jar
 AAPL> sell 100.05 200
   #1 SELL 200 @ 100.05 GTC
     filled 0, remaining 200 (resting)
@@ -25,24 +29,25 @@ AAPL> buy 100.05 250
 
 ## Build
 
-Needs a C++20 compiler and CMake 3.20+. No third-party dependencies.
+You need JDK 17 or newer. Maven comes with the repo through the wrapper, so you
+don't have to install it.
 
 ```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-ctest --test-dir build --output-on-failure
+./mvnw verify                 # compile, run the 40 JUnit tests, build the jar
 ```
 
-That produces `build/orderengine` (the CLI) and `build/ob_tests` (36 tests,
-no test framework to install).
+That produces `target/orderengine.jar`, which holds the CLI, the benchmarks and
+the JMH suite. On Windows, use `mvnw.cmd`.
 
 ## Run it
 
 ```sh
-build/orderengine                          # interactive
-build/orderengine --feed examples/feed.txt # replay a recorded order feed
-build/orderengine --bench 1000000 --hist   # throughput + latency histogram
-echo "buy 100 500" | build/orderengine     # pipe commands in
+java -jar target/orderengine.jar                          # interactive
+java -jar target/orderengine.jar --feed examples/feed.txt # replay a recorded order feed
+java -jar target/orderengine.jar --bench                  # unpaced throughput, both books
+java -jar target/orderengine.jar --latency --impl pooled  # p50/p99 at 2M orders/sec
+java -jar target/orderengine.jar --jmh                    # JMH suite
+echo "buy 100 500" | java -jar target/orderengine.jar     # pipe commands in
 ```
 
 | command | what it does |
@@ -51,7 +56,7 @@ echo "buy 100 500" | build/orderengine     # pipe commands in
 | `sell <price> <qty> [gtc\|ioc\|fok]` | limit sell |
 | `market <buy\|sell> <qty>` | market order, sweeps the book |
 | `cancel <id>` | pull a resting order |
-| `amend <id> <price> <qty>` | reduce keeps queue position, anything else re-queues |
+| `amend <id> <price> <qty>` | cancel-replace: a reduction keeps queue position, anything else re-queues |
 | `book [levels]` | the ladder |
 | `tape [n]` | recent trades |
 | `stats` / `latency [table]` | counters, latency distribution |
@@ -64,43 +69,58 @@ echo "buy 100 500" | build/orderengine     # pipe commands in
 ### The data structure
 
 ```
-bids_  std::map<Price, Level, std::greater<>>   begin() == best bid
-asks_  std::map<Price, Level, std::less<>>      begin() == best ask
-Level  { total, count, head, tail }             intrusive FIFO, head == oldest
-pool_  ObjectPool<OrderNode>                    recycles order nodes
-index_ std::unordered_map<OrderId, {node, level iterator}>
+per side
+  levels   TreeMap<Long, Level>          price-ordered; bids reversed, so firstKey() is best on both sides
+  byPrice  LongObjectHashMap<Level>      price -> level, no boxing and no tree walk
+  best     Level                         cached top of book
+per book
+  index    LongObjectHashMap<OrderNode>  order id -> node, for O(1) cancel and amend
+  pool     OrderPool                     recycled order nodes
+Level      { price, total, count, head, tail }   intrusive FIFO; head is the oldest order
 ```
 
-Two sorted maps, one per side, with the comparator reversed on the bid side so
-that `begin()` is the best price on *both* books. Matching then reads the same
-either way: take `begin()`, fill from the front of its queue, erase the level
-when it empties, repeat while the taker still has size and the prices cross.
+Matching reads the same way on either side. It takes the best level, fills from
+the front of that level's queue, and moves on when the level empties. It stops
+when the taker is filled or the prices no longer cross.
 
-Three decisions worth spelling out:
+These are the decisions worth explaining:
 
-**An intrusive linked list for the queue at each price, not `std::vector` or
-`std::priority_queue`.** Time priority is already FIFO, so it needs no heap at
-all � a queue is enough. What it does need is cancellation from the *middle*,
-because most orders in a real market are cancelled rather than filled. Each
-order lives in a node with `prev`/`next` pointers, so unlinking one is O(1) and
-leaves every other node where it was. A `priority_queue` cannot remove an
-arbitrary element at all, and a `vector` shifts everything behind the erase
-point.
+**The queue at each price is an intrusive doubly linked list.** Time priority is
+FIFO, so no heap is needed. What a queue does need is removal from the
+*middle*, because most orders in a real market are cancelled rather than filled.
+Each `OrderNode` carries `prev`/`next` links and a pointer to its level, so
+unlinking an order is O(1). A `PriorityQueue` can only remove an arbitrary
+element in O(n). An `ArrayList` would shift every element behind it.
 
-**An object pool for the nodes.** Resting orders come from `ObjectPool`, which
-carves fixed-size slots out of large blocks and recycles them through a free
-list. Once the pool has warmed up, resting or retiring an order is a pointer
-pop or push rather than a call into the allocator, and node addresses never
-move, which is what makes pointing at them from the index safe.
+**Cancels never touch the `TreeMap`.** Removing a key from a `TreeMap` is
+O(log L). When a cancel empties a level, the book marks the level empty and
+leaves it in place. If the emptied level was the best one, the cached top of
+book is flagged as stale. The next read prunes empty levels from the front of
+the tree, each one exactly once, so the cost is paid by the insert that created
+the level. If an order arrives at that price before the prune, the empty level
+is simply reused, with no tree insert. A sweep runs when empty levels
+outnumber live ones, and it runs on the insert path, so cancel stays O(1).
 
-**An `OrderId` index straight to the node and its level.** The index stores a
-pointer to the order's node and a `std::map` iterator to its price level. A
-cancel is a hash lookup, an unlink and, if the level empties, an erase by
-iterator, all constant time: it never scans the queue or searches the price map.
+**Top of book is a cached reference.** `bestBid()` and `bestAsk()` return
+`best.price` without walking the tree. The cache is updated when an order rests
+at a better price, and recomputed lazily after the best level empties.
 
-**Cached `total` per level.** Depth queries and fill-or-kill checks read one
-number per level instead of walking its queue, so they cost O(levels) rather
-than O(orders).
+**Object pooling.** Resting orders live in `OrderNode`s from an `OrderPool`, a
+free list pre-sized at startup. Resting or retiring an order is an array pop or
+push. `ExecReport` is reused across calls, and it stores fills in parallel
+`long[]` arrays rather than a `List<Trade>`. The trade tape is a ring buffer of
+primitives. Once the book is warm, the hot path allocates nothing; the only
+allocation left is the `TreeMap` entry when a brand-new price level appears.
+
+**Primitive collections.** `LongObjectHashMap` is an open-addressing map from
+`long` to object, written for this project. It never boxes a key, it allocates
+no node per entry, and it deletes by backward shift instead of tombstones, so
+probe chains don't decay as orders churn. Its hash keeps runs of 64 consecutive
+keys in adjacent slots. Order ids are mostly sequential, and the orders being
+filled and cancelled are the recent ones, so their slots share cache lines. The
+runs themselves are scattered with a Fibonacci hash, so strided ids don't pile
+up in one region. That one change took unpaced throughput from ~6.4M to ~10M
+ops/sec once the index was pre-sized to 1M slots.
 
 ### Cost
 
@@ -108,133 +128,194 @@ than O(orders).
 
 | operation | cost |
 | --- | --- |
-| best bid / best ask | O(1) |
-| submit that rests | O(log L) |
-| submit that trades | O(log L + F) |
+| best bid / best ask | O(1); amortised O(1) right after the best level empties |
 | cancel | O(1) |
 | amend (size reduction) | O(1) |
-| depth of k levels | O(k) |
-
-The `log L` is a `std::map` lookup. Production engines at the top of the latency
-league table replace it with a flat array indexed by tick, making it O(1) at the
-cost of pre-committing to a price range, and they intern symbols to avoid the
-string lookup this engine does per submission. Both are deliberate trade-offs
-here in favour of a book that cannot silently mis-handle an unexpected price.
+| submit that rests at an existing price | O(1) |
+| submit that opens a new price level | O(log L) |
+| submit that trades | O(F), plus O(log L) per level it empties |
+| depth of k levels | O(k + empty levels passed over) |
 
 ### Matching rules
 
-- **Price-time priority**: better price first; equal price, earlier arrival first.
-- **Trades print at the maker's price.** A buy at 101.00 hitting an ask at
-  100.00 trades at 100.00 — price improvement goes to the taker.
-- **Prices are integer ticks**, never `double`. The core is integer-only, and
-  decimals like `100.25` are converted at the CLI boundary, so `a == b` means
-  what it says and totals always reconcile.
+- **Price-time priority**: better price first; at an equal price, earlier arrival first.
+- **Trades print at the maker's price.** A buy at 101.00 that hits an ask at
+  100.00 trades at 100.00, so the price improvement goes to the taker.
+- **Prices are integer ticks** (`long`), never `double`. Decimals like `100.25`
+  are converted at the CLI boundary, so `a == b` means what it says and totals
+  always reconcile.
 - **Order types**: limit and market. **Time in force**: GTC (rests), IOC (fills
-  what it can, cancels the rest), FOK (all or nothing, and a rejected FOK leaves
+  what it can and cancels the rest), FOK (all or nothing; a rejected FOK leaves
   the book untouched).
-- **Amend** mirrors real venues: a pure size reduction keeps queue position,
-  while a price change or a size increase is a cancel/replace that goes to the
-  back of the queue and may trade immediately.
-- Self-trading is allowed: there is no notion of an account yet.
+- **Cancel-replace** (`amend`) works the way real venues do. A pure size
+  reduction keeps queue position. A price change or a size increase is a
+  cancel-replace that goes to the back of the queue and may trade immediately.
+- Self-trading is allowed, because there is no notion of an account yet.
 
-## Benchmark
+## Benchmarks
 
-`--bench` replays a synthetic flow with the shape a real venue sees: mostly
-passive quoting near the touch, a minority of aggressive takers, plus IOC, FOK,
-market orders and ~10% cancels. The whole stream is generated **before** the
-timer starts, so the measurement contains matching-engine work and nothing else.
+All three benchmarks replay the same synthetic flow, which has the shape a real
+venue sees. Most orders are passive quotes near a random-walking mid. A minority
+are aggressive takers, plus IOC, FOK and market orders, and about 10% are
+cancels. The flow is generated into primitive arrays **before** the clock
+starts, so the timed loop does matching-engine work and nothing else.
 
-One core of an AMD Ryzen 5 3600, Windows 10, g++ 15.2 `-O3`, 1M operations:
+Each benchmark runs two implementations of the same `Book` interface:
+
+- **`pooled`**: `OrderBook`, described above.
+- **`baseline`**: `BaselineOrderBook`, the same algorithm written the obvious
+  way. It allocates a new node per order and a new report per call, uses a
+  `HashMap<Long, Node>` index and boxed `TreeMap` lookups, records a `Trade`
+  object per fill, and removes levels eagerly. Both books are pre-sized for the
+  same number of orders. A test replays 300,000 operations through both and
+  requires identical fills, so the only difference between them is speed.
+
+Every figure below comes from one core of an AMD Ryzen 5 3600, Windows 10,
+JDK 17.0.17 with the default G1 collector.
+
+### Latency at 2M orders/sec: `--latency`
+
+This is the benchmark the headline number comes from. It offers 6M operations at
+a fixed 2M/sec, one every 500 ns. Each operation's latency is measured from when
+it was **scheduled**, not from when it started. So if the book stalls, every
+order queued behind the stall is charged for the wait. That is what a client
+would see, and it avoids coordinated omission, the usual way load tests
+understate their tail. The paced loop is warmed up before measuring, and each
+book runs in its own JVM.
+
+Five alternating runs of each:
+
+| book | p50 | p99 | p99.9 | max |
+| --- | --- | --- | --- | --- |
+| pooled | 100 ns | 3.5–6.9 µs | 19 µs – 0.56 ms | 0.16–1.3 ms |
+| baseline | 100–200 ns | 10–20 ms | 18–24 ms | 19–25 ms |
+
+The medians are the same, because both books run the same algorithm. The tails
+are not. The baseline allocates about 590 bytes per operation, which is about
+1.2 GB/sec at this rate. That triggers a young GC several times a second, and
+each pause backs up thousands of orders. The pooled book doesn't collect at all
+while it is being measured. Run with `-Xlog:gc` to see this directly.
+
+Caveats I would want a reader to know:
+
+- On Windows, `System.nanoTime` has ~100 ns granularity. Sub-microsecond
+  percentiles land on multiples of 100 ns, and individual samples below that are
+  noise.
+- The pooled book's tail beyond p99 comes from the OS (a desktop machine,
+  scheduler preemption). The spread between runs above is real.
+- The comparison depends on heap sizing and the collector. A low-pause
+  collector such as ZGC would shrink the baseline's pauses. Pooling removes the
+  need for one.
+
+### Throughput: `--bench`
+
+Unpaced: 2M operations replayed as fast as the book will take them.
 
 ```
-throughput pass
-  operations   1000000  (900098 submits, 99902 cancels)
-  elapsed      0.196 s
-  throughput   5094900 ops/sec
-  trades       684587
-  volume       35307190 shares
-  book left    117569 orders across 308 levels
+book         pooled
+operations   2000000  (1800674 submits, 199326 cancels)
+throughput   10250276 ops/sec
+trades       1395226
+book left    216752 orders across 454 levels
 
-latency pass (two clock reads per operation)
-  throughput   3219277 ops/sec
-  latency      n=1000000  min 0ns  mean 266ns  p50 200ns  p90 496ns
-               p99 1.09us  p99.9 2.18us  max 1.92ms
+book         baseline
+operations   2000000  (1800674 submits, 199326 cancels)
+throughput   5105522 ops/sec
+trades       1395226
+book left    216752 orders across 454 levels
 ```
 
-Run to run it lands between 4.0 and 5.1M ops/sec. Two caveats I would want a
-reader to know:
+Across runs, the pooled book lands between 10.2M and 11.5M ops/sec, and the
+baseline around 5.1M.
 
-- The throughput and latency passes are reported separately on purpose.
-  Timestamping every operation costs two clock reads and drops throughput by
-  about a third, so the two numbers cannot be read off one run.
-- `steady_clock` on Windows has ~100ns granularity, which is the same order as
-  the thing being measured. That is why 3.8% of samples read as 0ns and the
-  buckets cluster on multiples of 100ns. The percentiles are sound; the
-  individual sub-100ns samples are not.
+### JMH: `--jmh`
 
-The latency histogram is HdrHistogram-style: 8 linear buckets per power of two,
-so relative error stays around 1/8 across the range instead of the 2x a plain
-log2 histogram gives. Recording a sample is a shift, a mask and an increment —
-no allocation, so measuring barely perturbs what it measures.
+`OrderBookBenchmark` times a single operation from the same flow, in Throughput
+and SampleTime modes, for both books, plus a top-of-book read. Add `-prof gc` to
+get allocation per operation. The defaults are 2 forks, 5 warm-up iterations and
+5 measured iterations, with a 2 GB heap.
+
+| benchmark | book | throughput | p50 | p99 | p99.9 | p99.99 | allocation |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `mixedFlow` | pooled | 9.2 ops/µs | 0.1 µs | 0.6 µs | 1.2 µs | 14.7 µs | 4 B/op |
+| `mixedFlow` | baseline | 7.4 ops/µs | 0.3 µs | 0.7 µs | 3.3 µs | 72.5 µs | 586 B/op |
+| `topOfBook` | pooled | 134 ops/µs | | 0.1 µs | | | 0 |
+| `topOfBook` | baseline | 118 ops/µs | | 0.1 µs | | | 0 |
+
+The pooled book's 4 B/op is the fresh, pre-sized book that JMH builds before
+each iteration, spread across the operations in it.
+
+JMH runs unpaced, so it shows what a single operation costs: the pooled book
+is about 25% faster per operation, and at p99 the two are close. The large gap
+appears only under a fixed offered load, in `--latency`. There, the baseline's
+GC pauses queue up the orders behind them, and the queueing drives its p99 from
+under a microsecond to milliseconds. Use the right benchmark for the question:
+JMH for per-operation cost, `--latency` for what a client sees at 2M orders/sec.
 
 ## Tests
 
-`ob_tests` covers the rules that are easy to get quietly wrong: FIFO within a
-level, price priority beating time priority, partial fills on both sides, sweeps
-across levels, cancel from the middle of a queue, IOC/FOK/market semantics, a
-rejected FOK leaving the book byte-for-byte unchanged, and each amend path.
+There are 40 JUnit 5 tests. They cover the rules that are easy to get quietly
+wrong: FIFO within a level, price priority beating time priority, partial fills
+on both the taker and maker side, crossing orders that sweep several levels,
+cancel from the middle of a queue, IOC/FOK/market semantics, a rejected FOK
+leaving the book untouched, and each cancel-replace path.
 
-Three of them are worth singling out:
+Four of them do the heavy lifting:
 
-- **`price_time_priority_matches_a_reference_model`** replays 10,000 randomized
-  sequences of limit, market and cancel orders, each 100 events over a narrow
-  band of prices so that orders queue, cross and fill partially. Every sequence
-  runs through the engine and through a deliberately naive reference book (one
-  vector, a linear scan for the best price, earliest arrival wins a tie), and
-  every fill must agree on maker, price and size, in order. Cancels, rejects,
-  resting state and the final book must agree too.
-
-- **`random_flow_never_breaks_the_book`** replays 20,000 pseudo-random events
-  and asserts the invariants after every 500: the book is never crossed, each
-  level's cached total equals the sum of its queue, no zero-quantity order is
-  left resting, and the `OrderId` index matches the queues exactly. It also
-  checks conservation — the shares takers report as filled equal the volume the
-  book recorded.
-- **`benchmark_is_deterministic_for_a_seed`** pins the benchmark: the same seed
-  must produce the same trade count, so a performance change can never be a
-  workload change in disguise.
+- **`priceTimePriorityMatchesAReferenceModel`** replays 10,000 randomized
+  sequences, each 100 events of limit, market and cancel orders over a narrow
+  band of prices so that orders queue, cross and fill partially. It does this
+  for *both* books. Every sequence also runs through a deliberately naive
+  reference book: one list, a linear scan for the best price, and the earliest
+  arrival wins a tie. Every fill must agree on maker, price and size, in order.
+  Cancels, rejects, resting state and the final book must agree too.
+- **`pooledBookMatchesBaselineFillForFill`** runs 300,000 operations of the
+  benchmark flow through both books. Every operation must fill identically, and
+  the final books, stats and tapes must match. The optimizations change speed
+  and nothing else.
+- **`randomFlowNeverBreaksTheBook`** replays 20,000 random events, including
+  amends, and checks the invariants every 500 events. The book is never
+  crossed. Every level's cached total equals its queue. Empty-level counts, the
+  cached top of book, the id index and the node pool all agree. It also checks
+  conservation: the shares takers report as filled equal the volume the book
+  recorded.
+- **`primitiveIndexBehavesLikeAHashMap`** runs 200,000 random puts and removes
+  against `java.util.HashMap`, over a key space small enough to force long
+  probe chains, wrap-around and every case of backward-shift deletion.
 
 ## Layout
 
 ```
-include/ob/   types.hpp  object_pool.hpp  order_book.hpp  matching_engine.hpp  latency.hpp  bench.hpp  cli.hpp
-src/          order_book.cpp  matching_engine.cpp  latency.cpp  bench.cpp  cli.cpp  main.cpp
-tests/        test_order_book.cpp  test_engine.cpp  test_priority.cpp  test_harness.hpp  test_main.cpp
-examples/     feed.txt
+src/main/java/orderengine/
+  Book.java                 the interface both books implement
+  OrderBook.java            the pooled engine
+  BaselineOrderBook.java    the same algorithm on JDK collections
+  Level.java  OrderNode.java  OrderPool.java  LongObjectHashMap.java
+  ExecReport.java  Trade.java  LevelView.java  BookStats.java  Prices.java
+  Side.java  OrderType.java  Tif.java  Reject.java
+  MatchingEngine.java       one book per symbol, timed
+  LatencyHistogram.java     HdrHistogram-style, allocation-free recording
+  Cli.java  Main.java
+  bench/                    Flow (synthetic order flow), Bench, OrderBookBenchmark (JMH)
+src/test/java/orderengine/  OrderBookTest  PriceTimePriorityTest  RandomizedTest
+                            MatchingEngineTest  PricesAndLatencyTest
+examples/feed.txt
 ```
 
-`MatchingEngine` owns one `OrderBook` per symbol and times every submission.
-`Cli` is a thin text layer over it, which is why an interactive session, a piped
-script and a recorded feed all go through the same parser — every example above
-is runnable, and `examples/feed.txt` runs in CI as a smoke test.
+`MatchingEngine` owns one `OrderBook` per symbol and times every submit and
+cancel. `Cli` is a thin text layer over it. An interactive session, a piped
+script and a recorded feed all go through the same parser, and
+`examples/feed.txt` runs in CI as a smoke test.
 
 ## Roadmap
 
-- **Threading.** Each book is an independent state machine, so the natural split
-  is a single writer per symbol with books sharded across threads, and an SPSC
-  ring buffer for ingest. Deliberately not done yet: the engine is
-  single-threaded and therefore bit-for-bit deterministic on replay, which is
-  what makes the fuzz test meaningful.
-- **Array-of-ticks book** behind the same interface, to measure what dropping
-  `log L` is actually worth.
+- **Threading.** Each book is an independent state machine. The natural split
+  is a single writer per symbol, with books sharded across threads and an SPSC
+  ring buffer for ingest. I deliberately haven't done this yet: the engine is
+  single-threaded, so it is bit-for-bit deterministic on replay, and that is
+  what makes the differential tests meaningful.
+- **An array-of-ticks book** behind the same `Book` interface, to measure what
+  removing the remaining `log L` on new levels is worth.
 - **Stop and iceberg orders**, self-trade prevention, and an account model.
 - **Binary feed replay** (ITCH-style) instead of text, to benchmark parsing
   separately from matching.
-
-## A note for Windows users
-
-If a MinGW build segfaults inside `<fstream>`, an MSVCRT-built
-`libstdc++-6.dll` earlier on `PATH` — Git for Windows ships one — is being
-loaded by a UCRT-built binary. `CMakeLists.txt` links the runtime statically on
-MinGW so this cannot happen; if you compile by hand, pass
-`-static-libstdc++ -static-libgcc`.
